@@ -1,0 +1,18 @@
+{:paths ["src" "bb"]
+ :deps {metosin/malli {:mvn/version "0.17.0"}}
+ :tasks
+ {:requires ([harness.cli :as harness])
+  json-check {:doc "Validate a JSON AST file"
+              :task (harness/check-json *command-line-args*)}
+  json-compile {:doc "Compile a JSON AST file to Clojure"
+                :task (harness/compile-json *command-line-args*)}
+  semantic-check {:doc "Load generated Clojure and run an EDN semantic test fixture"
+                  :task (harness/semantic-check *command-line-args*)}
+  json-smoke {:doc "Create, validate, and compile a minimal JSON AST"
+              :task (harness/smoke *command-line-args*)}
+  json-dry-run {:doc "Create an isolated JSON AST project folder without calling a model"
+                :task (harness/dry-run *command-line-args*)}
+  json-run {:doc "Run the JSON AST harness against an OpenAI-compatible endpoint or GGUF"
+            :task (harness/run-json *command-line-args*)}
+  chat-ping {:doc "Ping an OpenAI-compatible chat endpoint"
+             :task (harness/chat-ping *command-line-args*)}}}
