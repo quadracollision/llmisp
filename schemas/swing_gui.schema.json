@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/swing_gui.schema.json",
+  "title": "Swing GUI AST",
+  "description": "Closed JSON AST for simple Java Swing GUI programs.",
+  "$ref": "#/$defs/node",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "positiveInt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "scalar": {
+      "type": ["string", "integer", "number", "boolean", "null"]
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": {"const": "show-message"},
+            "message": {"$ref": "#/$defs/nonEmptyString"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {"const": "clear-form"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["plugin", "kind", "db", "table", "values"],
+          "properties": {
+            "plugin": {"const": "sqlite"},
+            "kind": {"const": "sqlite-insert"},
+            "db": {"type": "string", "pattern": "^[^/\\\\]+\\.sqlite3$"},
+            "table": {"$ref": "#/$defs/id"},
+            "values": {
+              "type": "object",
+              "additionalProperties": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["source", "id"],
+                    "properties": {
+                      "source": {"const": "control"},
+                      "id": {"$ref": "#/$defs/id"}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["source", "value"],
+                    "properties": {
+                      "source": {"const": "literal"},
+                      "value": {"$ref": "#/$defs/scalar"}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["source"],
+                    "properties": {
+                      "source": {"const": "now"}
+                    }
+                  }
+                ]
+              }
+            },
+            "message": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["plugin", "kind", "db", "table", "target", "columns"],
+          "properties": {
+            "plugin": {"const": "sqlite"},
+            "kind": {"const": "sqlite-refresh-table"},
+            "db": {"type": "string", "pattern": "^[^/\\\\]+\\.sqlite3$"},
+            "table": {"$ref": "#/$defs/id"},
+            "target": {"$ref": "#/$defs/id"},
+            "columns": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+            "message": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "node": {
+      "oneOf": [
+        {"$ref": "#/$defs/window"},
+        {"$ref": "#/$defs/panel"},
+        {"$ref": "#/$defs/label"},
+        {"$ref": "#/$defs/button"},
+        {"$ref": "#/$defs/textField"},
+        {"$ref": "#/$defs/textArea"},
+        {"$ref": "#/$defs/comboBox"},
+        {"$ref": "#/$defs/checkBox"},
+        {"$ref": "#/$defs/table"},
+        {"$ref": "#/$defs/tabs"}
+      ]
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "title", "width", "height", "children"],
+      "properties": {
+        "op": {"const": "window"},
+        "title": {"$ref": "#/$defs/nonEmptyString"},
+        "width": {"$ref": "#/$defs/positiveInt"},
+        "height": {"$ref": "#/$defs/positiveInt"},
+        "children": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/node"}}
+      }
+    },
+    "panel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id", "children"],
+      "properties": {
+        "op": {"const": "panel"},
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"$ref": "#/$defs/nonEmptyString"},
+        "layout": {"enum": ["flow", "border", "grid", "row"]},
+        "children": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/node"}}
+      }
+    },
+    "label": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "text"],
+      "properties": {
+        "op": {"const": "label"},
+        "id": {"$ref": "#/$defs/id"},
+        "text": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "button": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id", "label"],
+      "properties": {
+        "op": {"const": "button"},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"$ref": "#/$defs/nonEmptyString"},
+        "action": {"$ref": "#/$defs/action"}
+      }
+    },
+    "textField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id"],
+      "properties": {
+        "op": {"const": "text-field"},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"$ref": "#/$defs/nonEmptyString"},
+        "columns": {"$ref": "#/$defs/positiveInt"}
+      }
+    },
+    "textArea": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id"],
+      "properties": {
+        "op": {"const": "text-area"},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"$ref": "#/$defs/nonEmptyString"},
+        "rows": {"$ref": "#/$defs/positiveInt"},
+        "columns": {"$ref": "#/$defs/positiveInt"}
+      }
+    },
+    "comboBox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id", "options"],
+      "properties": {
+        "op": {"const": "combo-box"},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"$ref": "#/$defs/nonEmptyString"},
+        "options": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonEmptyString"}}
+      }
+    },
+    "checkBox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id", "label"],
+      "properties": {
+        "op": {"const": "check-box"},
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id", "columns"],
+      "properties": {
+        "op": {"const": "table"},
+        "id": {"$ref": "#/$defs/id"},
+        "columns": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {"$ref": "#/$defs/scalar"}
+          }
+        }
+      }
+    },
+    "tabs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "id", "tabs"],
+      "properties": {
+        "op": {"const": "tabs"},
+        "id": {"$ref": "#/$defs/id"},
+        "tabs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "title", "children"],
+            "properties": {
+              "id": {"$ref": "#/$defs/id"},
+              "title": {"$ref": "#/$defs/nonEmptyString"},
+              "children": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/node"}}
+            }
+          }
+        }
+      }
+    }
+  }
+}

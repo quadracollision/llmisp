@@ -1,0 +1,4 @@
+{:plugins [harness.plugins.data-transformation
+           harness.plugins.gui-page
+           harness.plugins.sqlite
+           harness.plugins.api-router]}

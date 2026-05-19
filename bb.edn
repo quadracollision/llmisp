@@ -1,5 +1,6 @@
 {:paths ["src" "bb"]
- :deps {metosin/malli {:mvn/version "0.17.0"}}
+ :deps {metosin/malli {:mvn/version "0.17.0"}
+        org.xerial/sqlite-jdbc {:mvn/version "3.49.1.0"}}
  :tasks
  {:requires ([harness.cli :as harness])
   json-check {:doc "Validate a JSON AST file"
@@ -10,6 +11,14 @@
                   :task (harness/semantic-check *command-line-args*)}
   json-smoke {:doc "Create, validate, and compile a minimal JSON AST"
               :task (harness/smoke *command-line-args*)}
+  gui-smoke {:doc "Create, validate, and compile/load a deterministic Swing GUI AST"
+             :task (harness/gui-smoke *command-line-args*)}
+  gui-run {:doc "Run deterministic Swing GUI generation from a contract file"
+           :task (harness/gui-run *command-line-args*)}
+  gui-open {:doc "Explicitly launch a generated Swing GUI desktop window"
+            :task (harness/gui-open *command-line-args*)}
+  gui-jar {:doc "Compile a generated Swing GUI source file into a runnable jar"
+           :task (harness/gui-jar *command-line-args*)}
   json-dry-run {:doc "Create an isolated JSON AST project folder without calling a model"
                 :task (harness/dry-run *command-line-args*)}
   json-run {:doc "Run the JSON AST harness against an OpenAI-compatible endpoint or GGUF"

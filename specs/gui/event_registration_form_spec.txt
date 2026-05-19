@@ -1,0 +1,14 @@
+Build a simple native Java Swing GUI for event registration.
+
+The window title should be Event Registration.
+
+The GUI should have these main components:
+
+- an attendee form with fields attendee-name, email, ticket-type, organization, and accessibility-needs
+- a session selection panel with options workshop, keynote, networking, and afterparty
+- a registration summary panel showing available seats, waitlist count, and confirmed registrations
+- action buttons for clear form, register attendee, and show summary
+
+The clear form action should clear user-entered fields.
+Register attendee and show summary may show confirmation messages.
+Do not include external services, file actions, database actions, or network actions.

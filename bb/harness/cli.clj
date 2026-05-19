@@ -1,14 +1,24 @@
 (ns harness.cli
   (:require [babashka.fs :as fs]
+            [babashka.process :as p]
             [cheshire.core :as json]
+            [clojure.edn :as edn]
             [clojure.string :as str]
+            [harness.action-plugins :as action-plugins]
             [harness.common :as common]
+            [harness.gui-smoke :as gui-smoke]
             [harness.model :as model-io]
+            [harness.plugin-loader :as plugin-loader]
+            [harness.protocols :as protocols]
             [harness.prompt :as prompt]
             [harness.semantic :as semantic]
             [harness.sqlite :as sqlite]
+            [harness.swing-lowerer :as swing-lowerer]
+            [harness.swing-schema :as swing-schema]
             [harness.validation :as validation]
             [llmisp.clj-ast :as clj-ast]))
+
+(plugin-loader/load-configured-plugins!)
 
 (def usage
   (str/join
@@ -18,6 +28,11 @@
     "  bb json-compile <candidate.ast.json> <candidate.clj> [--force]"
     "  bb semantic-check <candidate.clj> <semantic-test.edn>"
     "  bb json-smoke [project-dir]"
+    "  bb gui-smoke [project-dir]"
+    "  bb gui-run --contract-file <contract.edn|contract.json> --project-dir <dir>"
+    "  bb gui-run --self-plan --task-file <spec.txt> --project-dir <dir> [--endpoint <url> --model <name> | --gguf <model.gguf> --llama-server-bin <bin>]"
+    "  bb gui-open <candidate.clj>"
+    "  bb gui-jar <candidate.clj> <app.jar>"
     "  bb json-dry-run <project-dir>"
     "  bb json-run --task-file <spec.txt> --project-dir <dir> [--self-plan] [--skeleton-first --where-pass --column-pass] [--semantic-test-file <test.edn> --semantic-oracle-source user|benchmark|assistant|unknown] [--auto-semantic-test] [--allow-semantic-guidance] [--endpoint <url> --model <name> | --gguf <model.gguf> --llama-server-bin <bin>] [--grammar-file <ast.gbnf> | --json-schema-file <ast.schema.json>]"
     "  bb chat-ping <endpoint> <model>"]))
@@ -40,6 +55,7 @@
       (case arg
         "--task-file" (recur (nnext remaining) (assoc opts :task-file (second remaining)))
         "--task-text" (recur (nnext remaining) (assoc opts :task-text (second remaining)))
+        "--contract-file" (recur (nnext remaining) (assoc opts :contract-file (second remaining)))
         "--project-dir" (recur (nnext remaining) (assoc opts :project-dir (second remaining)))
         "--endpoint" (recur (nnext remaining) (assoc opts :endpoint (second remaining)))
         "--model" (recur (nnext remaining) (assoc opts :model (second remaining)))
@@ -56,6 +72,7 @@
         "--auto-semantic-test" (recur (next remaining) (assoc opts :auto-semantic-test true))
         "--allow-semantic-guidance" (recur (next remaining) (assoc opts :allow-semantic-guidance true))
         "--self-plan" (recur (next remaining) (assoc opts :self-plan true))
+        "--component-pass" (recur (next remaining) (assoc opts :component-pass true))
         "--skeleton-first" (recur (next remaining) (assoc opts :skeleton-first true))
         "--where-pass" (recur (next remaining) (assoc opts :where-pass true))
         "--column-pass" (recur (next remaining) (assoc opts :column-pass true))
@@ -119,6 +136,331 @@
      :report-path report-path
      :db-path db-path
      :log-path log-path}))
+
+(defn- gui-project-paths [opts]
+  (let [project-dir (fs/path (or (:project-dir opts) "tmp/bb_gui_run"))
+        gui-path (fs/path project-dir "candidate.gui.json")
+        clj-path (fs/path project-dir "candidate.clj")
+        report-path (fs/path project-dir "report.json")
+        db-path (fs/path project-dir "session.sqlite3")
+        log-path (fs/path project-dir "llama-server.log")]
+    (fs/create-dirs project-dir)
+    {:project-dir project-dir
+     :gui-path gui-path
+     :clj-path clj-path
+     :report-path report-path
+     :db-path db-path
+     :log-path log-path}))
+
+(defn- read-contract-file [path]
+  (let [text (slurp path)]
+    (if (str/ends-with? (str/lower-case path) ".json")
+      (json/parse-string text true)
+      (edn/read-string text))))
+
+(defn- load-check-clojure-source [clj-path]
+  (let [load-check (p/shell {:out :string
+                             :err :string
+                             :continue true}
+                            "clojure" "-M" "-e"
+                            (str "(load-file " (pr-str (str clj-path)) ") (println :loaded)"))]
+    (if (zero? (:exit load-check))
+      {:exit_code 0
+       :stdout (:out load-check)
+       :stderr (:err load-check)
+       :validator "clojure-source-load"}
+      {:exit_code (:exit load-check)
+       :stdout (:out load-check)
+       :stderr (:err load-check)
+       :validator "clojure-source-load"})))
+
+(defn- gui-self-plan! [{:keys [task endpoint model temperature max-tokens db-path session-id]}]
+  (let [messages [{:role "user" :content (prompt/gui-planner-prompt task)}]
+        content (model-io/chat-completion {:endpoint endpoint
+                                           :model model
+                                           :messages messages
+                                           :temperature temperature
+                                           :max-tokens max-tokens})
+        parsed (json-extract content)
+        contract (:sanitized_contract parsed)
+        artifact {:raw_output content
+                  :parsed parsed
+                  :sanitized_contract contract}]
+    (sqlite/save-artifact! db-path session-id "gui_self_plan"
+                           (json/generate-string (json-safe artifact) {:pretty true}))
+    artifact))
+
+(defn- validate-gui-node [node]
+  (let [wrapped {:op "window"
+                 :title "Validation Window"
+                 :width 100
+                 :height 100
+                 :children [node]}]
+    (swing-schema/validate wrapped)))
+
+(defn- component-root-id [node]
+  (:id node))
+
+(defn- gui-node-ids [node]
+  (let [own-id (when-let [id (:id node)] [id])
+        child-ids (mapcat gui-node-ids (:children node))
+        tab-ids (mapcat (fn [tab]
+                          (concat [(:id tab)]
+                                  (mapcat gui-node-ids (:children tab))))
+                        (:tabs node))]
+    (concat own-id child-ids tab-ids)))
+
+(defn- validate-component-boundary [contract component-id node]
+  (let [reserved-other-ids (disj (set (:required_components contract)) component-id)
+        nested-reserved (->> (gui-node-ids node)
+                             rest
+                             (filter reserved-other-ids)
+                             distinct
+                             vec)]
+    (if (seq nested-reserved)
+      {:exit_code 1
+       :stdout ""
+       :stderr (str "[gui/component-boundary] component " component-id
+                    " must not define other required component ids: "
+                    (pr-str nested-reserved))
+       :validator "gui-component-boundary"
+       :ok false
+       :nested_required_components nested-reserved}
+      {:exit_code 0
+       :stdout "GUI component boundary OK\n"
+       :stderr ""
+       :validator "gui-component-boundary"
+       :ok true})))
+
+(defn- replace-gui-component [node component-id replacement]
+  (cond
+    (and (map? node) (= component-id (:id node)))
+    replacement
+
+    (map? node)
+    (cond-> node
+      (:children node)
+      (update :children #(mapv (fn [child]
+                                  (replace-gui-component child component-id replacement))
+                                %))
+      (:tabs node)
+      (update :tabs #(mapv (fn [tab]
+                              (update tab :children
+                                      (fn [children]
+                                        (mapv (fn [child]
+                                                (replace-gui-component child component-id replacement))
+                                              children))))
+                            %)))
+
+    :else node))
+
+(defn- gui-component-attempt! [{:keys [task contract component-id endpoint model temperature max-tokens previous-output error-text]}]
+  (let [messages [{:role "user"
+                   :content (prompt/gui-component-prompt task contract component-id previous-output error-text)}]
+        content (model-io/chat-completion {:endpoint endpoint
+                                           :model model
+                                           :messages messages
+                                           :temperature temperature
+                                           :max-tokens max-tokens})
+        raw-parsed (json-extract content)
+        parsed (if (and (map? raw-parsed)
+                        (:id raw-parsed)
+                        (not= component-id (:id raw-parsed)))
+                 (assoc raw-parsed :id component-id)
+                 raw-parsed)
+        id-check (if (= component-id (component-root-id parsed))
+                   {:exit_code 0 :stdout "GUI component id OK\n" :stderr "" :validator "gui-component-id" :ok true}
+                   {:exit_code 1
+                    :stdout ""
+                    :stderr (str "[gui/component-id] expected root id " component-id
+                                 ", got " (pr-str (component-root-id parsed)))
+                    :validator "gui-component-id"
+                    :ok false})
+        shape-check (when (zero? (:exit_code id-check))
+                      (validate-gui-node parsed))
+        boundary-check (when (and shape-check (:ok shape-check))
+                         (validate-component-boundary contract component-id parsed))
+        check (cond
+                (not (zero? (:exit_code id-check))) id-check
+                (not (:ok shape-check)) shape-check
+                (not (:ok boundary-check)) boundary-check
+                :else boundary-check)]
+    {:prompt messages
+     :raw_output content
+     :raw_parsed raw-parsed
+     :parsed parsed
+     :check check}))
+
+(defn- gui-component! [{:keys [ast component-id db-path session-id] :as opts}]
+  (let [max-repairs (or (:repair-attempts opts) 1)]
+    (loop [attempt 0
+         previous-output nil
+         error-text nil]
+      (let [result (gui-component-attempt! (assoc opts
+                                                  :previous-output previous-output
+                                                  :error-text error-text))
+            artifact (assoc result
+                            :component_id component-id
+                            :attempt attempt)]
+        (sqlite/save-artifact! db-path session-id (str "gui_component_" component-id "_" attempt)
+                               (json/generate-string (json-safe artifact) {:pretty true}))
+        (if (:ok (:check result))
+          (replace-gui-component ast component-id (:parsed result))
+          (if (< attempt max-repairs)
+            (recur (inc attempt)
+                   (:raw_output result)
+                   (:stderr (:check result)))
+            (throw (ex-info "GUI component generation failed"
+                            {:check (:check result)
+                             :component_id component-id}))))))))
+
+(defn- refine-gui-components! [{:keys [ast contract] :as opts}]
+  (reduce (fn [acc component-id]
+            (if (= "actions-panel" component-id)
+              acc
+              (gui-component! (assoc opts
+                                     :ast acc
+                                     :component-id component-id))))
+          ast
+          (:required_components contract)))
+
+(defn- gui-control-node? [node]
+  (contains? #{"text-field" "text-area" "combo-box" "check-box"} (:op node)))
+
+(defn- gui-table-node? [node]
+  (= "table" (:op node)))
+
+(defn- gui-collect [pred node]
+  (concat (when (pred node) [node])
+          (mapcat #(gui-collect pred %) (:children node))
+          (mapcat (fn [tab]
+                    (mapcat #(gui-collect pred %) (:children tab)))
+                  (:tabs node))))
+
+(defn- persistence-meta-field? [field-name]
+  (contains? #{"submitted-at" "status"} field-name))
+
+(defn- missing-gui-data-fields [contract ast]
+  (let [ids (set (gui-node-ids ast))]
+    (->> (:data_fields contract)
+         (remove persistence-meta-field?)
+         (remove ids)
+         vec)))
+
+(defn- data-field-row [field-name]
+  {:op "panel"
+   :id (str field-name "-row")
+   :layout "row"
+   :children [{:op "label"
+               :id (str field-name "-label")
+               :text (-> field-name
+                         (str/replace #"-" " ")
+                         str/capitalize)}
+              {:op "text-field"
+               :id field-name
+               :label (-> field-name
+                          (str/replace #"-" " ")
+                          str/capitalize)}]})
+
+(defn- form-panel? [node]
+  (and (= "panel" (:op node))
+       (or (str/includes? (str (:id node)) "form")
+           (some gui-control-node? (:children node)))))
+
+(defn- add-fields-to-first-form [node fields]
+  (let [done? (atom false)]
+    (letfn [(walk [current]
+              (cond
+                (and (not @done?) (form-panel? current))
+                (do
+                  (reset! done? true)
+                  (update current :children into (mapv data-field-row fields)))
+
+                (map? current)
+                (cond-> current
+                  (:children current) (update :children #(mapv walk %))
+                  (:tabs current) (update :tabs
+                                          #(mapv (fn [tab]
+                                                   (update tab :children
+                                                           (fn [children]
+                                                             (mapv walk children))))
+                                                 %)))
+
+                :else current))]
+      (let [updated (walk node)]
+        (if @done?
+          updated
+          (update updated :children conj {:op "panel"
+                                          :id "generated-fields-form"
+                                          :title "Additional Fields"
+                                          :layout "flow"
+                                          :children (mapv data-field-row fields)}))))))
+
+(defn- gui-table-ids [ast]
+  (->> (gui-collect gui-table-node? ast)
+       (keep :id)
+       distinct
+       vec))
+
+(defn- rewrite-plugin-actions [ast]
+  (let [table-ids (->> (gui-collect gui-table-node? ast)
+                       (keep :id)
+                       distinct
+                       vec)
+        ctx {:table-ids (set table-ids)}]
+    (letfn [(walk [node]
+              (if (map? node)
+                (cond-> (cond-> node
+                          (get-in node [:action :plugin])
+                          (update :action #(action-plugins/rewrite-action ctx %)))
+                  (:children node) (update :children #(mapv walk %))
+                  (:tabs node) (update :tabs
+                                       #(mapv (fn [tab]
+                                                (update tab :children
+                                                        (fn [children]
+                                                          (mapv walk children))))
+                                              %)))
+                node))]
+      (walk ast))))
+
+(defn- prune-non-action-panel-action-buttons [contract ast]
+  (let [action-ids (set (:actions contract))]
+    (if-not (and (seq action-ids)
+                 (some #{"actions-panel"} (:required_components contract)))
+      ast
+      (letfn [(walk [inside-actions-panel? node]
+                (if-not (map? node)
+                  node
+                  (let [inside-actions-panel? (or inside-actions-panel?
+                                                  (= "actions-panel" (:id node)))]
+                    (if (and (not inside-actions-panel?)
+                             (= "button" (:op node))
+                             (contains? action-ids (:id node)))
+                      nil
+                      (cond-> node
+                        (:children node)
+                        (update :children (fn [children]
+                                            (->> children
+                                                 (keep #(walk inside-actions-panel? %))
+                                                 vec)))
+                        (:tabs node)
+                        (update :tabs
+                                (fn [tabs]
+                                  (mapv (fn [tab]
+                                          (update tab :children
+                                                  (fn [children]
+                                                    (->> children
+                                                         (keep #(walk inside-actions-panel? %))
+                                                         vec))))
+                                        tabs))))))))]
+        (walk false ast)))))
+
+(defn- finalize-gui-ast [contract ast]
+  (let [missing-fields (missing-gui-data-fields contract ast)]
+    (cond->> ast
+      true (prune-non-action-panel-action-buttons contract)
+      (seq missing-fields) (#(add-fields-to-first-form % missing-fields))
+      true rewrite-plugin-actions)))
 
 (defn- default-semantic-test-path [task-file]
   (when task-file
@@ -212,6 +554,326 @@
     (println "DB:" (str db-path))
     (println "OK")))
 
+(defn gui-smoke [args]
+  (let [project-dir (fs/path (or (first args) "tmp/bb_gui_smoke"))
+        gui-path (fs/path project-dir "candidate.gui.json")
+        clj-path (fs/path project-dir "candidate.clj")
+        report-path (fs/path project-dir "report.json")
+        db-path (fs/path project-dir "session.sqlite3")
+        ast gui-smoke/sample-ast
+        ast-text (json/generate-string (json-safe ast) {:pretty true})]
+    (fs/create-dirs project-dir)
+    (spit (str gui-path) ast-text)
+    (let [session-id (sqlite/init-session! db-path "gui-smoke" "deterministic Swing GUI smoke")]
+      (sqlite/save-artifact! db-path session-id "gui_ast" ast-text)
+      (let [shape-check (swing-schema/validate ast)]
+        (if (:ok shape-check)
+          (do
+            (swing-lowerer/write-source! (str clj-path) ast)
+            (let [load-check (load-check-clojure-source clj-path)]
+              (when-not (zero? (:exit_code load-check))
+                (throw (ex-info "generated Swing Clojure source failed to load"
+                                {:check load-check}))))
+            (spit (str report-path)
+                  (json/generate-string
+                   {:project_dir (str project-dir)
+                    :session_id session-id
+                    :db (str db-path)
+                    :gui_ast (str gui-path)
+                    :clj (str clj-path)
+                    :ok true
+                    :smoke true
+                    :check {:exit_code 0
+                            :stdout "Swing GUI AST Malli OK\nSwing Clojure source load OK\n"
+                            :stderr ""
+                            :validator "swing-malli+source-load"}}
+                   {:pretty true}))
+            (println "GUI:" (str gui-path))
+            (println "CLJ:" (str clj-path))
+            (println "REPORT:" (str report-path))
+            (println "DB:" (str db-path))
+            (println "OK"))
+          (do
+            (spit (str report-path)
+                  (json/generate-string
+                   {:project_dir (str project-dir)
+                    :session_id session-id
+                    :db (str db-path)
+                    :gui_ast (str gui-path)
+                    :ok false
+                    :smoke true
+                    :check shape-check}
+                   {:pretty true}))
+            (fail! (:stderr shape-check))))))))
+
+(defn gui-run [args]
+  (let [opts (parse-args args)
+        _ (when-not (or (:contract-file opts) (:self-plan opts))
+            (fail! "--contract-file or --self-plan is required for gui-run"))
+        _ (when (and (:contract-file opts) (:self-plan opts))
+            (fail! "gui-run accepts either --contract-file or --self-plan, not both"))
+        _ (when (and (:self-plan opts) (not (:task-file opts)))
+            (fail! "gui-run --self-plan requires --task-file"))
+        {:keys [project-dir gui-path clj-path report-path db-path log-path]} (gui-project-paths opts)
+        host (or (:llama-host opts) "127.0.0.1")
+        port (or (:llama-port opts) 18080)
+        endpoint (or (:endpoint opts)
+                     (when (:gguf opts) (model-io/local-endpoint host port)))
+        model (model-io/model-name opts)
+        max-tokens (or (:planner-max-tokens opts) (:max-tokens opts) 2048)
+        session-id (sqlite/init-session! db-path "gui-run"
+                                         (if (:self-plan opts)
+                                           (str "GUI self-plan run: " (:task-file opts))
+                                           (str "GUI contract run: " (:contract-file opts))))
+        proc (when (and (:self-plan opts) (:gguf opts))
+               (model-io/launch-llama! opts log-path))]
+    (try
+      (when (and (:self-plan opts) (not endpoint))
+        (fail! "gui-run --self-plan requires --endpoint or --gguf"))
+      (let [task (when (:self-plan opts) (task-text opts))
+            plan-artifact (when (:self-plan opts)
+                            (gui-self-plan! {:task task
+                                             :endpoint endpoint
+                                             :model model
+                                             :temperature (:temperature opts)
+                                             :max-tokens max-tokens
+                                             :db-path db-path
+                                             :session-id session-id}))
+            raw-contract (if (:self-plan opts)
+                           (:sanitized_contract plan-artifact)
+                           (read-contract-file (:contract-file opts)))
+            contract (protocols/normalize-contract raw-contract)
+            contract-check (protocols/validate-contract contract)]
+        (sqlite/save-artifact! db-path session-id "raw_contract"
+                               (json/generate-string (json-safe raw-contract) {:pretty true}))
+        (sqlite/save-artifact! db-path session-id "normalized_contract"
+                               (json/generate-string (json-safe contract) {:pretty true}))
+        (if-not (zero? (:exit_code contract-check))
+          (do
+            (spit (str report-path)
+                  (json/generate-string
+                   {:project_dir (str project-dir)
+                    :session_id session-id
+                    :db (str db-path)
+                    :contract_file (:contract-file opts)
+                    :task_file (:task-file opts)
+                    :self_plan (boolean (:self-plan opts))
+                    :ok false
+                    :check contract-check}
+                   {:pretty true}))
+            (fail! (:stderr contract-check)))
+          (let [skeleton-ast (protocols/assemble-skeleton-ast {:contract contract :opts opts})
+                ast (if (:component-pass opts)
+                      (try
+                        (refine-gui-components! {:ast skeleton-ast
+                                                 :contract contract
+                                                 :task task
+                                                 :endpoint endpoint
+                                                 :model model
+                                                 :temperature (:temperature opts)
+                                                 :max-tokens (or (:column-max-tokens opts) (:max-tokens opts) 2048)
+                                                 :repair-attempts (or (:repair-attempts opts) 1)
+                                                 :db-path db-path
+                                                 :session-id session-id})
+                        (catch clojure.lang.ExceptionInfo ex
+                          (let [check (or (:check (ex-data ex))
+                                          {:exit_code 1
+                                           :stdout ""
+                                           :stderr (.getMessage ex)
+                                           :validator "gui-component-pass"})]
+                            (spit (str report-path)
+                                  (json/generate-string
+                                   {:project_dir (str project-dir)
+                                    :session_id session-id
+                                    :db (str db-path)
+                                    :contract_file (:contract-file opts)
+                                    :task_file (:task-file opts)
+                                    :self_plan (boolean (:self-plan opts))
+                                    :component_pass true
+                                    :contract (json-safe contract)
+                                    :ok false
+                                    :check check}
+                                   {:pretty true}))
+                            (fail! (:stderr check)))))
+                      skeleton-ast)
+                ast (finalize-gui-ast contract ast)
+                ast-text (json/generate-string (json-safe ast) {:pretty true})
+                shape-check (swing-schema/validate ast)
+                completeness-check (when (:ok shape-check)
+                                     (protocols/completeness-check {:contract contract
+                                                                    :ast ast
+                                                                    :stage :post-skeleton}))
+                check (cond
+                        (not (:ok shape-check)) shape-check
+                        (not (zero? (:exit_code completeness-check))) completeness-check
+                        :else nil)]
+            (spit (str gui-path) ast-text)
+            (sqlite/save-artifact! db-path session-id "gui_ast" ast-text)
+            (if check
+              (do
+                (spit (str report-path)
+                      (json/generate-string
+                       {:project_dir (str project-dir)
+                        :session_id session-id
+                        :db (str db-path)
+                        :contract_file (:contract-file opts)
+                        :task_file (:task-file opts)
+                        :self_plan (boolean (:self-plan opts))
+                        :contract (json-safe contract)
+                        :gui_ast (str gui-path)
+                        :ok false
+                        :check check}
+                       {:pretty true}))
+                (fail! (:stderr check)))
+              (do
+                (swing-lowerer/write-source! (str clj-path) ast)
+                (let [load-check (load-check-clojure-source clj-path)
+                      ok? (zero? (:exit_code load-check))
+                      final-check (if ok?
+                                    {:exit_code 0
+                                     :stdout (str (:stdout contract-check)
+                                                  (:stdout shape-check)
+                                                  (:stdout completeness-check)
+                                                  "Swing Clojure source load OK\n")
+                                     :stderr ""
+                                     :validator "gui-page+swing-malli+source-load"}
+                                    load-check)]
+                  (sqlite/save-artifact! db-path session-id "final_check"
+                                         (json/generate-string (json-safe final-check) {:pretty true}))
+                  (spit (str report-path)
+                        (json/generate-string
+                         {:project_dir (str project-dir)
+                          :session_id session-id
+                          :db (str db-path)
+                          :contract_file (:contract-file opts)
+                          :task_file (:task-file opts)
+                          :self_plan (boolean (:self-plan opts))
+                          :component_pass (boolean (:component-pass opts))
+                          :contract (json-safe contract)
+                          :gui_ast (str gui-path)
+                          :clj (str clj-path)
+                          :ok ok?
+                          :deterministic (not (:self-plan opts))
+                          :check final-check}
+                         {:pretty true}))
+                  (if ok?
+                    (do
+                      (println "GUI:" (str gui-path))
+                      (println "CLJ:" (str clj-path))
+                      (println "REPORT:" (str report-path))
+                      (println "DB:" (str db-path))
+                      (println "OK"))
+                    (fail! (:stderr final-check)))))))))
+      (finally
+        (model-io/stop-process! proc)))))
+
+(defn gui-open [args]
+  (ensure-args! args 1)
+  (let [clj-path (first args)]
+    (when-not (fs/exists? clj-path)
+      (fail! (str "GUI source file does not exist: " clj-path)))
+    (println "Opening Swing GUI from" clj-path)
+    (println "This command intentionally launches a desktop window.")
+    (let [result @(p/process ["clojure" "-M" "-i" clj-path "-m" "generated.swing-gui"]
+                             {:out :inherit
+                              :err :inherit})]
+      (when-not (zero? (:exit result))
+        (fail! (str "gui-open failed with exit code " (:exit result)))))))
+
+(defn- run-process! [label args opts]
+  (let [result @(p/process args (merge {:out :string :err :string} opts))]
+    (when-not (zero? (:exit result))
+      (throw (ex-info (str label " failed")
+                      {:label label
+                       :args args
+                       :exit (:exit result)
+                       :stdout (:out result)
+                       :stderr (:err result)})))
+    result))
+
+(defn- path-separator []
+  (System/getProperty "path.separator"))
+
+(defn- classpath-entries []
+  (let [result (run-process! "clojure classpath" ["clojure" "-Spath"] {})]
+    (->> (str/split (str/trim (:out result)) (re-pattern (java.util.regex.Pattern/quote (path-separator))))
+         (remove str/blank?)
+         (map fs/path)
+         vec)))
+
+(defn- copy-generated-source! [candidate-clj src-dir]
+  (let [target (fs/path src-dir "generated" "swing_gui.clj")]
+    (fs/create-dirs (fs/parent target))
+    (spit (str target) (slurp (str candidate-clj)))
+    target))
+
+(defn- remove-jar-signatures! [staging-dir]
+  (let [meta-inf (fs/path staging-dir "META-INF")]
+    (when (fs/exists? meta-inf)
+      (doseq [path (fs/list-dir meta-inf)
+              :let [file-name (str/upper-case (str (fs/file-name path)))]
+              :when (or (str/ends-with? file-name ".SF")
+                        (str/ends-with? file-name ".DSA")
+                        (str/ends-with? file-name ".RSA"))]
+        (fs/delete-if-exists path)))))
+
+(defn- merge-classpath-entry! [staging-dir entry]
+  (cond
+    (and (fs/regular-file? entry) (str/ends-with? (str/lower-case (str entry)) ".jar"))
+    (run-process! "dependency jar extract" ["jar" "xf" (str entry)] {:dir (str staging-dir)})
+
+    (fs/directory? entry)
+    nil
+
+    :else nil))
+
+(defn- compile-gui-main! [base-cp src-dir classes-dir]
+  (let [cp (str/join (path-separator) (map str (concat base-cp [src-dir classes-dir])))
+        compile-form (str "(binding [*compile-path* " (pr-str (str classes-dir)) "] "
+                          "(compile 'generated.swing-gui))")]
+    (run-process! "generated Swing AOT compile"
+                  ["java" "-cp" cp "clojure.main" "-e" compile-form]
+                  {})))
+
+(defn- verify-gui-jar! [jar-path]
+  (run-process! "generated Swing jar load"
+                ["java" "-cp" (str jar-path)
+                 "clojure.main" "-e"
+                 "(require 'generated.swing-gui) (println :loaded)"]
+                {}))
+
+(defn gui-jar [args]
+  (ensure-args! args 2)
+  (let [[candidate-clj output-jar] (map fs/path args)
+        output-jar (fs/absolutize output-jar)
+        build-dir (fs/path (fs/parent output-jar) ".gui-jar-build")
+        src-dir (fs/path build-dir "src")
+        classes-dir (fs/path build-dir "classes")
+        staging-dir (fs/path build-dir "staging")
+        manifest-path (fs/path build-dir "MANIFEST.MF")]
+    (when-not (fs/exists? candidate-clj)
+      (fail! (str "GUI source file does not exist: " candidate-clj)))
+    (fs/create-dirs (fs/parent output-jar))
+    (when (fs/exists? build-dir)
+      (fs/delete-tree build-dir))
+    (fs/create-dirs classes-dir)
+    (fs/create-dirs staging-dir)
+    (copy-generated-source! candidate-clj src-dir)
+    (let [base-cp (classpath-entries)]
+      (compile-gui-main! base-cp src-dir classes-dir)
+      (doseq [entry base-cp]
+        (merge-classpath-entry! staging-dir entry))
+      (remove-jar-signatures! staging-dir)
+      (fs/copy-tree classes-dir staging-dir {:replace-existing true})
+      (spit (str manifest-path) "Manifest-Version: 1.0\nMain-Class: generated.swing_gui\n\n")
+      (run-process! "generated Swing jar build"
+                    ["jar" "cfm" (str output-jar) (str manifest-path) "-C" (str staging-dir) "."]
+                    {})
+      (verify-gui-jar! output-jar)
+      (println "JAR:" (str output-jar))
+      (println "Main-Class: generated.swing_gui")
+      (println "Load check: OK"))))
+
 (defn dry-run [args]
   (ensure-args! args 1)
   (let [{:keys [project-dir ast-path clj-path report-path db-path]} (project-paths {:project-dir (first args)})
@@ -277,27 +939,6 @@
           str/lower-case
           (str/replace #"[^a-z0-9]+" "-")
           (str/replace #"(^-+|-+$)" "")))
-
-(defn- contract-function-name [task contract]
-  (or (some-> (:function contract) str (str/split #"/") last kebab)
-      (second (re-find #"(?i)main function\s+([a-z][a-z0-9-]*)" task))
-      "main"))
-
-(defn- contract-module-name [task contract]
-  (or (second (re-find #"(?i)module must be named\s+([a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)*)" task))
-      (when (and (:function contract) (str/includes? (str (:function contract)) "/"))
-        (-> (:function contract) str (str/split #"/") first (str/replace #"_" "-")))
-      "demo.generated"))
-
-(defn- collection-name [task contract]
-  (or (some-> (:input_shapes contract) first :name kebab)
-      (second (re-find #"(?i)receives a collection named\s+([a-z][a-z0-9-]*)" task))
-      (second (re-find #"(?i)accepts\s+([a-z][a-z0-9-]*)" task))
-      "items"))
-
-(defn- item-name [task]
-  (or (second (re-find #"(?i)query over [a-z][a-z0-9-]* as\s+([a-z][a-z0-9-]*)" task))
-      "item"))
 
 (defn- input-field-names [contract]
   (let [metadata-keys #{:name :field :type :collection :arg_index :fields :field_shapes}]
@@ -456,39 +1097,6 @@
           :target {:op "var" :name item}
           :field output-key}})
 
-(defn- nil-entry [output-key]
-  {:key output-key
-   :expr {:op "nil"}})
-
-(defn- skeleton-ast [task contract]
-  (let [module-name (contract-module-name task contract)
-        function-name (contract-function-name task contract)
-        collection (collection-name task contract)
-        item (item-name task)
-        output-keys (mapv name (:required_output_keys contract))
-        input-fields (input-field-names contract)
-        sort-key (get-in contract [:order_hint :key])
-        sort-direction (or (get-in contract [:order_hint :direction]) "asc")]
-    {:module module-name
-     :defs [{:name function-name
-             :args [collection]
-             :expr (cond-> {:op "query"
-                            :rationale "Skeleton query: column-pass fills projection logic."
-                            :collection {:op "var" :name collection}
-                            :item item
-                            :where []
-                            :select {:op "map"
-                                     :entries (mapv (fn [output-key]
-                                                      (if (contains? input-fields output-key)
-                                                        (passthrough-entry output-key item)
-                                                        (nil-entry output-key)))
-                                                    output-keys)}}
-                     sort-key
-                     (assoc :sort {:expr {:op "field"
-                                          :target {:op "var" :name item}
-                                          :field (name sort-key)}
-                                   :direction sort-direction}))}]}))
-
 (defn- some-indexed [f coll]
   (first (keep-indexed f coll)))
 
@@ -569,21 +1177,6 @@
                   (conj entries entry))]
     (assoc-in ast entries-path updated)))
 
-(defn- select-entries [ast]
-  (when-let [entries-path (ast-select-entries-path ast)]
-    (get-in ast entries-path)))
-
-(defn- literal-nil-output-keys [ast required-output-keys]
-  (let [required (set (map name required-output-keys))
-        entries-by-key (->> (select-entries ast)
-                            (map (fn [entry] [(:key entry) entry]))
-                            (into {}))]
-    (->> required
-         (filter (fn [output-key]
-                   (= "nil" (get-in entries-by-key [output-key :expr :op]))))
-         sort
-         vec)))
-
 (defn- scoped-column-contract [contract output-key]
   (-> contract
       (assoc :required_output_keys [output-key])
@@ -591,24 +1184,6 @@
 
 (defn- scoped-column-candidate [ast entries-path entry]
   (assoc-in ast entries-path [entry]))
-
-(defn- refinement-completeness-check [ast generation-contract]
-  (let [nil-keys (literal-nil-output-keys ast (:required_output_keys generation-contract))]
-    (if (seq nil-keys)
-      {:exit_code 1
-       :stdout ""
-       :stderr (str "[json-ast/refinement-failed] Column pass failed to generate valid logic for keys: "
-                    (pr-str (mapv keyword nil-keys))
-                    ". All model attempts for these keys were rejected by static semantic linters or left as skeleton placeholders.")
-       :validator "refinement-completeness"
-       :refinement_failed {:literal_nil_keys (mapv keyword nil-keys)}}
-      {:exit_code 0
-       :stdout "Refinement completeness OK\n"
-       :stderr ""
-       :validator "refinement-completeness"})))
-
-(defn- where-completeness-check [ast generation-contract]
-  (validation/validate-where-completeness generation-contract ast))
 
 (defn- query-item-name [ast]
   (letfn [(walk [expr]
@@ -1218,7 +1793,9 @@
                                               :session-id session-id}))
             oracle (semantic-oracle opts semantic-path)
             guidance (generation-guidance opts semantic-path self-plan-artifact)
-            generation-contract (enrich-contract-field-types task (:semantic_contract guidance))
+            generation-contract (some->> (:semantic_contract guidance)
+                                         (enrich-contract-field-types task)
+                                         protocols/normalize-contract)
             guidance (assoc guidance :semantic_contract generation-contract)
             semantic-assisted? (= "semantic_assisted" (:mode guidance))]
       (when (and (:column-pass opts)
@@ -1246,7 +1823,11 @@
         (let [messages [{:role "user" :content (prompt/ast-prompt task generation-contract previous-ast error-text)}]
               skeleton? (and (:skeleton-first opts) (zero? attempt))
               content (if skeleton?
-                        (json/generate-string (skeleton-ast task generation-contract) {:pretty true})
+                        (json/generate-string
+                         (protocols/assemble-skeleton-ast {:task task
+                                                           :opts opts
+                                                           :contract generation-contract})
+                         {:pretty true})
                         (chat-completion {:endpoint endpoint
                                           :model model
                                           :messages messages
@@ -1273,23 +1854,32 @@
               where-ast (if (and (:where-pass opts)
                                  generation-contract
                                  (:ok pre-pass-shape-check))
-                          (refine-where! {:ast pass-base
-                                          :endpoint endpoint
-                                          :model model
-                                          :task task
-                                          :temperature temperature
-                                          :where-max-tokens (:where-max-tokens opts)
-                                          :grammar grammar
-                                          :schema-path (:json-schema-file opts)
-                                          :generation-contract generation-contract
-                                          :db-path db-path
-                                          :session-id session-id
-                                          :attempt-index attempt})
+                          (protocols/refine-where {:ast pass-base
+                                                   :endpoint endpoint
+                                                   :model model
+                                                   :task task
+                                                   :temperature temperature
+                                                   :where-max-tokens (:where-max-tokens opts)
+                                                   :grammar grammar
+                                                   :schema-path (:json-schema-file opts)
+                                                   :generation-contract generation-contract
+                                                   :contract generation-contract
+                                                   :db-path db-path
+                                                   :session-id session-id
+                                                   :attempt-index attempt
+                                                   :legacy-refine-where refine-where!})
                           pass-base)
               where-completeness-check (when (and (:where-pass opts)
                                                   generation-contract
                                                   (:ok pre-pass-shape-check))
-                                         (where-completeness-check where-ast generation-contract))
+                                         (protocols/completeness-check {:stage :post-where
+                                                                        :task task
+                                                                        :opts opts
+                                                                        :ast where-ast
+                                                                        :contract generation-contract
+                                                                        :db-path db-path
+                                                                        :session-id session-id
+                                                                        :attempt-index attempt}))
               where-failed? (and where-completeness-check
                                   (not (zero? (:exit_code where-completeness-check))))
               _ (when where-completeness-check
@@ -1302,25 +1892,34 @@
                            generation-contract
                            (:ok pre-pass-shape-check)
                            (not where-failed?))
-                    (refine-columns! {:ast where-ast
-                                      :endpoint endpoint
-                                      :model model
-                                      :task task
-                                      :temperature temperature
-                                      :column-max-tokens (:column-max-tokens opts)
-                                      :grammar grammar
-                                      :schema-path (:json-schema-file opts)
-                                      :generation-contract generation-contract
-                                      :db-path db-path
-                                      :session-id session-id
-                                      :attempt-index attempt})
+                    (protocols/refine-columns {:ast where-ast
+                                               :endpoint endpoint
+                                               :model model
+                                               :task task
+                                               :temperature temperature
+                                               :column-max-tokens (:column-max-tokens opts)
+                                               :grammar grammar
+                                               :schema-path (:json-schema-file opts)
+                                               :generation-contract generation-contract
+                                               :contract generation-contract
+                                               :db-path db-path
+                                               :session-id session-id
+                                               :attempt-index attempt
+                                               :legacy-refine-columns refine-columns!})
                     where-ast)
               ast-text (json/generate-string ast {:pretty true})]
           (spit (str ast-path) ast-text)
           (sqlite/save-artifact! db-path session-id "raw_model_output" content)
           (sqlite/save-artifact! db-path session-id "json_ast" ast-text)
           (let [refinement-check (when (and (:column-pass opts) generation-contract)
-                                   (refinement-completeness-check ast generation-contract))
+                                   (protocols/completeness-check {:stage :post-columns
+                                                                  :task task
+                                                                  :opts opts
+                                                                  :ast ast
+                                                                  :contract generation-contract
+                                                                  :db-path db-path
+                                                                  :session-id session-id
+                                                                  :attempt-index attempt}))
                 attempt-semantic-path (when semantic-assisted? semantic-path)
                 check (cond
                         where-failed? where-completeness-check

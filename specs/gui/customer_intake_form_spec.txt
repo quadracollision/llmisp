@@ -1,0 +1,14 @@
+Build a simple native Java Swing GUI for customer intake.
+
+The window title should be Customer Intake.
+
+The GUI should have these main components:
+
+- an applicant details form with fields full-name, email, phone, company, and requested-plan
+- a qualification panel with fields budget-range, timeline, and current-provider
+- a notes area for intake-notes
+- action buttons for clear form, save draft, and submit intake
+
+The clear form action should clear user-entered fields.
+The save draft and submit intake actions may show a confirmation message.
+Do not include external services, file actions, database actions, or network actions.

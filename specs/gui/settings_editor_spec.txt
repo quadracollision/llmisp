@@ -1,0 +1,14 @@
+Build a simple native Java Swing GUI for application settings.
+
+The window title should be Settings Editor.
+
+The GUI should have these main components:
+
+- a profile settings form with fields display-name, email, timezone, and language
+- a notification settings panel with options email-alerts, sms-alerts, and weekly-summary
+- an access settings panel with fields role, department, and backup-approver
+- action buttons for save settings, reset form, and test notification
+
+The reset form action should clear user-entered fields.
+Save settings and test notification may show confirmation messages.
+Do not include external services, file actions, database actions, or network actions.

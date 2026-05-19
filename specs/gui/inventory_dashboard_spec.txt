@@ -1,0 +1,14 @@
+Build a simple native Java Swing GUI for inventory planning.
+
+The window title should be Inventory Dashboard.
+
+The GUI should have these main components:
+
+- summary cards for total low-stock items, delayed suppliers, and open reorder requests
+- a low-stock table with columns sku, warehouse, on-hand, reorder-point, and reorder-action
+- a reorder form with fields sku, warehouse, requested-quantity, supplier, and notes
+
+The GUI should provide actions for refresh, create reorder, and export report.
+
+Do not include event handler code yet.
+Do not include external services or file actions.

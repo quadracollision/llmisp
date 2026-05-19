@@ -34,6 +34,82 @@
    "- no solution AST\n\n"
    "Focus on business rules, filter conditions, sort condition, output keys, fallback rules, and derived classifications."))
 
+(defn gui-planner-prompt [task]
+  (str
+   "Read the GUI spec and produce one strict JSON object only. No Markdown. No raw Swing. No Java. No Clojure.\n"
+   "This is a planning pass for a local GUI code generator. Do not emit a GUI AST. Do not emit source code.\n"
+   "Infer only a sanitized GUI contract that is directly stated or plainly implied by the text spec.\n\n"
+   "Task:\n" task "\n\n"
+   "Return exactly this top-level JSON shape:\n"
+   "{\"reasoning_summary\":\"compact GUI planning summary...\",\"sanitized_contract\":{...}}\n\n"
+   "The sanitized_contract may contain only these keys:\n"
+   "- use_case: must be \"gui-page\"\n"
+   "- title: window title string\n"
+   "- window_kind: one of dashboard, form, settings, detail, triage, approval, registration, generic\n"
+   "- required_components: array of kebab-case component ids required by the spec\n"
+   "- data_fields: array of kebab-case data/control field ids explicitly needed by tables or forms\n"
+   "- actions: array of kebab-case action ids for buttons or user actions explicitly requested\n"
+   "- persistence: object only if local persistence is explicitly requested. Shape: {\"plugin\":\"sqlite\",\"db\":\"local-name.sqlite3\",\"table\":\"submissions\",\"target\":\"submissions-data\",\"columns\":[\"submitted-at\",\"full-name\",\"email\",\"status\"]}\n"
+   "- width: integer window width if stated, otherwise omit\n"
+   "- height: integer window height if stated, otherwise omit\n\n"
+   "Rules:\n"
+   "- required_components must contain layout-level components, not every tiny label.\n"
+   "- Do not include generic wrapper components such as main-container, root-panel, page-wrapper, or main-form-container when specific components are already listed.\n"
+   "- Use kebab-case names only, never snake_case.\n"
+   "- Do not include sample rows, expected outputs, code, Swing class names, event handlers, scripts, or a GUI AST.\n"
+   "- If the spec describes a table, include a component id ending in -table and list its columns in data_fields.\n"
+   "- If the spec describes a form, include a component id ending in -form and list form fields in data_fields.\n"
+   "- If the spec describes buttons or operations, list them in actions.\n"
+   "- If the spec explicitly requests local SQLite persistence, include persistence.plugin \"sqlite\", the requested db filename, table name, refresh target table id, and saved table columns.\n"
+   "- Keep the contract compact and general."))
+
+(defn gui-component-prompt [task contract component-id previous-output error-text]
+  (str
+   "Emit one strict compact JSON object only. No Markdown. No raw Swing. No Java. No Clojure. No prose.\n"
+   "Generate exactly one Swing GUI AST subtree for one required component.\n\n"
+   "Task:\n" task "\n\n"
+   "Sanitized GUI contract:\n" (pr-str contract) "\n\n"
+   "Target component id: " component-id "\n\n"
+   (when previous-output
+     (str "Previous invalid component output:\n" previous-output "\n\n"))
+   (when error-text
+     (str "Validation error for that component:\n" error-text "\n\n"))
+   "Return exactly one node object. The root node must have id \"" component-id "\".\n"
+   "Allowed ops exactly: panel, label, button, text-field, text-area, combo-box, check-box, table, tabs.\n"
+   "Do not emit a window node. The harness owns the top-level window.\n\n"
+   "Allowed shapes:\n"
+   "panel: {\"op\":\"panel\",\"id\":\"component-id\",\"title\":\"Title\",\"layout\":\"flow\",\"children\":[NODE,...]}\n"
+   "field row panel: {\"op\":\"panel\",\"id\":\"email-row\",\"layout\":\"row\",\"children\":[{\"op\":\"label\",\"text\":\"Email\"},{\"op\":\"text-field\",\"id\":\"email\",\"label\":\"Email\"}]}\n"
+   "label: {\"op\":\"label\",\"id\":\"optional-id\",\"text\":\"Text\"}\n"
+   "button: {\"op\":\"button\",\"id\":\"refresh\",\"label\":\"Refresh\"}\n"
+   "button with safe action: {\"op\":\"button\",\"id\":\"clear\",\"label\":\"Clear\",\"action\":{\"kind\":\"clear-form\"}}\n"
+   "message action: {\"op\":\"button\",\"id\":\"save\",\"label\":\"Save\",\"action\":{\"kind\":\"show-message\",\"message\":\"Saved.\"}}\n"
+   "sqlite insert action: {\"op\":\"button\",\"id\":\"save-draft\",\"label\":\"Save Draft\",\"action\":{\"plugin\":\"sqlite\",\"kind\":\"sqlite-insert\",\"db\":\"customer-intake.sqlite3\",\"table\":\"submissions\",\"values\":{\"full-name\":{\"source\":\"control\",\"id\":\"full-name\"},\"status\":{\"source\":\"literal\",\"value\":\"draft\"},\"submitted-at\":{\"source\":\"now\"}},\"message\":\"Draft saved.\"}}\n"
+   "sqlite refresh action: {\"op\":\"button\",\"id\":\"refresh-submissions\",\"label\":\"Refresh Submissions\",\"action\":{\"plugin\":\"sqlite\",\"kind\":\"sqlite-refresh-table\",\"db\":\"customer-intake.sqlite3\",\"table\":\"submissions\",\"target\":\"submissions-data\",\"columns\":[\"submitted-at\",\"full-name\",\"email\",\"status\"]}}\n"
+   "text-field: {\"op\":\"text-field\",\"id\":\"sku\",\"label\":\"SKU\",\"columns\":24}\n"
+   "text-area: {\"op\":\"text-area\",\"id\":\"notes\",\"label\":\"Notes\",\"rows\":4,\"columns\":32}\n"
+   "combo-box: {\"op\":\"combo-box\",\"id\":\"status\",\"label\":\"Status\",\"options\":[\"Open\",\"Closed\"]}\n"
+   "check-box: {\"op\":\"check-box\",\"id\":\"include-closed\",\"label\":\"Include closed\"}\n"
+   "table: {\"op\":\"table\",\"id\":\"low-stock-table\",\"columns\":[\"sku\",\"warehouse\"]}\n"
+   "tabs: {\"op\":\"tabs\",\"id\":\"details-tabs\",\"tabs\":[{\"id\":\"main\",\"title\":\"Main\",\"children\":[NODE]}]}\n\n"
+   "Rules:\n"
+   "- Use kebab-case ids only.\n"
+   "- The root node must define only the target component. Do not nest or redefine any other required_components from the contract inside this component subtree.\n"
+   "- Use only fields/actions from the contract when creating form controls, table columns, and buttons.\n"
+   "- Label nodes are leaf nodes. Never put layout, children, fields, buttons, or controls inside a label node.\n"
+   "- To group a label with a control, use a panel node with layout \"row\" and put the label and control as sibling children.\n"
+   "- If the component id ends in -table, prefer a table node inside a titled panel.\n"
+   "- If the component id ends in -form, prefer text-field/text-area controls inside a titled panel. Do not emit action buttons when the contract has an actions-panel; action buttons are owned by actions-panel.\n"
+   "- If the component id includes cards, prefer labels inside a titled panel.\n"
+   "- If the component id is actions-panel or includes actions, generate one button for each action listed in the contract.\n"
+   "- For clear/reset actions, use {\"kind\":\"clear-form\"}. For save/submit/approve/reject/refresh/test/show actions, use {\"kind\":\"show-message\",\"message\":\"...\"}.\n"
+   "- If the contract includes persistence.plugin sqlite, save/submit buttons must use sqlite-insert and refresh buttons must use sqlite-refresh-table.\n"
+   "- SQLite action db must be a local .sqlite3 filename. SQLite table and columns must be kebab-case. SQLite values may source from controls, literal values, or now.\n"
+   "- Button action is optional. Built-in action.kind must be show-message or clear-form. SQLite action.kind must be sqlite-insert or sqlite-refresh-table with plugin \"sqlite\".\n"
+   "- show-message may only display a static message string. clear-form only clears controls in the current generated window.\n"
+   "- Do not invent event handlers, scripts, file actions, network actions, class names, or source code.\n"
+   "- Keep the subtree small and valid."))
+
 (defn ast-prompt [task semantic-contract previous-ast error-text]
   (str
    "Emit one strict JSON object only. No Markdown. No LLmisp source. No raw Clojure. No prose.\n"

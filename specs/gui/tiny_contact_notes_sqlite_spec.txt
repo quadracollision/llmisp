@@ -1,0 +1,24 @@
+Build a small native Java Swing GUI for saving contact notes locally.
+
+The window title should be Tiny Contact Notes.
+
+The GUI should have these main components:
+
+- a contact form with fields name, email, and note
+- a saved contacts table with columns saved-at, name, email, note, and status
+- action buttons for clear form, save note, and refresh contacts
+
+Persistence requirements:
+
+- Use a local SQLite database named tiny-contact-notes.sqlite3 in the project/output directory.
+- Save note should insert the current form values into a contacts table with status saved.
+- Refresh contacts should reload the saved contacts table from the SQLite database.
+- Clear form should clear user-entered fields only.
+
+Safety requirements:
+
+- Do not call external services.
+- Do not use network actions.
+- Do not use shell commands.
+- Do not write arbitrary files other than the local SQLite database requested above.
+- Database actions must be expressed as controlled GUI action declarations, not raw Java, raw Clojure, or handwritten event handler code.

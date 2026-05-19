@@ -1,0 +1,14 @@
+Build a simple native Java Swing GUI for invoice approval.
+
+The window title should be Invoice Approval.
+
+The GUI should have these main components:
+
+- an invoice review table with columns invoice-id, vendor, amount, due-date, and approval-status
+- a payment risk panel showing overdue, high-value, and missing-po counts
+- an approval form with fields invoice-id, approver, decision, and comment
+- action buttons for approve, reject, request more info, and clear form
+
+The clear form action should clear user-entered fields.
+Approve, reject, and request more info may show confirmation messages.
+Do not include external services, file actions, database actions, or network actions.

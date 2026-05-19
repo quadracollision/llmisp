@@ -1,0 +1,14 @@
+Build a simple native Java Swing GUI for incident triage.
+
+The window title should be Incident Triage.
+
+The GUI should have these main components:
+
+- an incident queue table with columns incident-id, severity, service, owner, and status
+- a severity summary panel showing critical, high, medium, and low counts
+- an assignment form with fields incident-id, owner, escalation-channel, and notes
+- action buttons for refresh, assign owner, clear form, and acknowledge incident
+
+The clear form action should clear user-entered fields.
+The acknowledge incident and assign owner actions may show a confirmation message.
+Do not include external services, file actions, database actions, or network actions.

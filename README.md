@@ -1,61 +1,23 @@
 # JSON AST Agent Harness
 
-This project is a local code-generation harness for turning business-rule text specs into Clojure programs. The validated local setup was tested with Gemma 4 E2B GGUF served by llama.cpp.
+This project is a local code-generation harness for turning text specs into Clojure programs. The validated local setup was tested with Gemma 4 E2B GGUF served by llama.cpp. Other models may work, but they are untested.
 
-The core idea is to stop asking a small local model to write source code directly. Instead, the model emits a constrained JSON AST. The harness validates that AST, lowers it to Clojure forms, pretty-prints source, and records every generation/repair artifact in SQLite.
+The core idea is to stop asking a small local model to write full source code directly. Instead, the model emits constrained JSON AST fragments. The harness validates those fragments, assembles larger structures programmatically, lowers the accepted AST to Clojure, and records every generation/repair artifact in SQLite.
 
 ## What It Does
 
 - Runs a local Gemma 4 E2B GGUF model through `llama-server`.
-- Can target another OpenAI-compatible chat endpoint experimentally, but models other than Gemma 4 E2B have not been tested.
+- Can target another OpenAI-compatible chat endpoint experimentally.
 - Uses a planner pass to derive a sanitized contract from a text spec.
-- Builds a deterministic skeleton AST before asking the model for detailed logic.
-- Uses micro-stepped passes for query filters and derived columns.
+- Builds deterministic skeleton ASTs before asking the model for detailed logic.
+- Uses micro-stepped passes for query filters, derived columns, and GUI components.
 - Validates generated JSON AST with Malli, JSON Schema/GBNF-compatible constraints, field provenance checks, type-flow checks, and semantic structure guards.
 - Compiles accepted JSON AST into Clojure source.
 - Logs prompts, raw model output, accepted ASTs, rejected attempts, and execution traces into a per-run SQLite DB.
 
-## Why JSON AST
+## Business Logic Path
 
-Small local models are unreliable when asked to emit full source code. They drift on syntax, invent operations, or produce partial programs.
-
-This harness makes the local program own structure:
-
-- The model translates one small semantic unit at a time.
-- The harness assembles larger structures programmatically.
-- Invalid logic is rejected before codegen.
-- Empty required filters and unfinished derived columns are hard failures.
-
-## Current Status
-
-The harness has passed a blind batch of five business specs with no answer-bearing semantic fixtures:
-
-- dynamic pricing
-- fraud chargeback triage
-- logistics routing
-- support escalation
-- vendor payment risk
-
-That proves structural generation and Clojure codegen across multiple domains. It does not prove independent semantic correctness unless you also provide clean held-out input/output tests.
-
-## Requirements
-
-- Babashka
-- Python 3
-- `llama-server` from llama.cpp, or another OpenAI-compatible chat endpoint
-- A Gemma 4 E2B GGUF model if running locally
-
-The Gemma 4 E2B GGUF model is not included. Other models may work, but they are untested.
-
-## Smoke Test
-
-```bash
-bb json-smoke tmp/smoke
-```
-
-This validates the local Babashka classpath, JSON AST validation, and Clojure codegen path without calling a model.
-
-## Run One Spec With Local GGUF
+The business-rule plugin generates Clojure data-transformation functions.
 
 ```bash
 bb json-run \
@@ -84,19 +46,42 @@ Outputs are written under the project directory:
 - `session.sqlite3`
 - `llama-server.log`
 
-## Run Blind Batch
+## Native Swing GUI Path
+
+The `:gui-page` plugin generates simple native Java Swing programs. The model emits a sanitized GUI contract and component subtrees; the harness owns Swing lowering, safe event wiring, and jar packaging.
 
 ```bash
-GGUF=/path/to/gemma4-e2b.gguf \
-LLAMA_SERVER_BIN=/path/to/llama-server \
-OUT_DIR=tmp/blind_specs \
-PORT_START=18700 \
-LLAMA_CTX_SIZE=4096 \
-LLAMA_GPU_LAYERS=24 \
-scripts/run_blind_specs.sh
+bb gui-run \
+  --self-plan \
+  --component-pass \
+  --gguf /path/to/gemma4-e2b.gguf \
+  --llama-server-bin /path/to/llama-server \
+  --task-file specs/gui/inventory_dashboard_spec.txt \
+  --project-dir tmp/gui_inventory
 ```
 
-The batch writes `summary.jsonl` plus one project folder per spec.
+Build the generated Swing program into a runnable jar:
+
+```bash
+bb gui-jar tmp/gui_inventory/candidate.clj tmp/gui_inventory/app.jar
+```
+
+Run it manually when you want to open the desktop window:
+
+```bash
+java -jar tmp/gui_inventory/app.jar
+```
+
+GUI actions are intentionally closed and deterministic. Buttons can use safe action maps such as `show-message` and `clear-form`; the model cannot emit arbitrary Java, Swing listener code, Clojure forms, file actions, network actions, or shell commands.
+
+## Smoke Tests
+
+```bash
+bb json-smoke tmp/json_smoke
+bb gui-smoke tmp/gui_smoke
+```
+
+These validate the local Babashka classpath, JSON AST validation, Clojure codegen path, Swing AST validation, and Swing source load path without calling a model or opening a GUI window.
 
 ## Benchmark Honesty
 
@@ -114,3 +99,11 @@ Clean benchmark evidence should use fixtures that were not generated by the assi
 ## Runtime Files
 
 See `RUNTIME_FILES.md` for the minimal file manifest.
+
+## Extension Boundary
+
+The harness has a plugin boundary under `bb/harness/plugins/`.
+
+- `data_transformation.clj` owns business-rule generation.
+- `gui_page.clj` owns Swing GUI generation.
+- `api_router.clj` is a blueprint plugin showing how another use case can register lifecycle methods without changing the root pipeline.
